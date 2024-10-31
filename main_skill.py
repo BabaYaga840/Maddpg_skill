@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pettingzoo.mpe import simple_adversary_v3, simple_spread_v3, simple_tag_v3
 
-from MADDPG import MADDPG
+from MADDPG_skill import MADDPG
 
 
 def get_env(env_name, ep_len=25):
@@ -45,6 +45,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1024, help='batch-size of replay buffer')
     parser.add_argument('--actor_lr', type=float, default=0.01, help='learning rate of actor')
     parser.add_argument('--critic_lr', type=float, default=0.01, help='learning rate of critic')
+    parser.add_argument('--option_freq', type=int, default=10, help='frequency of option updates')
     args = parser.parse_args()
 
     # create folder to save result
@@ -56,17 +57,27 @@ if __name__ == '__main__':
     os.makedirs(result_dir)
 
     env, dim_info = get_env(args.env_name, args.episode_length)
+    agent_num = env.num_agents
+    obs = env.reset()
+    agent_list = list(obs[1].keys())
     maddpg = MADDPG(dim_info, args.buffer_capacity, args.batch_size, args.actor_lr, args.critic_lr,
-                    result_dir)
+                    result_dir, agent_num, agent_list)
 
     step = 0  # global step counter
-    agent_num = env.num_agents
     # reward of each episode of each agent
     episode_rewards = {agent_id: np.zeros(args.episode_num) for agent_id in env.agents}
     for episode in range(args.episode_num):
         obs = env.reset()
         obs = obs[0]
+        jump_obs = obs
         agent_reward = {agent_id: 0 for agent_id in env.agents}  # agent reward of the current episode
+        if step % args.option_freq == 0:
+            options = maddpg.generate_options_for_all_agents(obs)
+            
+        if step % args.option_freq == 0 and step >= args.random_steps:
+            maddpg.add_op(options, obs, jump_obs)
+            jump_obs = obs
+
         while env.agents:  # interact with the env for an episode
             step += 1
             if step < args.random_steps:
@@ -75,7 +86,7 @@ if __name__ == '__main__':
                 action = maddpg.select_action(obs)
             next_obs, reward, done, _, info = env.step(action)
             # env.render()
-            maddpg.add(obs, action, reward, next_obs, done)
+            maddpg.add(obs, action, reward, next_obs, done, options)
 
             for agent_id, r in reward.items():  # update reward
                 agent_reward[agent_id] += r
@@ -83,8 +94,11 @@ if __name__ == '__main__':
             if step >= args.random_steps and step % args.learn_interval == 0:  # learn every few steps
                 maddpg.learn(args.batch_size, args.gamma)
                 maddpg.update_target(args.tau)
+                maddpg.learn_option_model()
 
             obs = next_obs
+
+        
 
         # episode finishes
         for agent_id, r in agent_reward.items():  # record reward

@@ -6,9 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from Agent import Agent
-from Buffer import Buffer
-
+from Agent_skill import Agent
+from Buffer import Buffer_op, Option_Buffer
+from option_model import OptionModel
 
 def setup_logger(filename):
     """ set up logger with filename. """
@@ -28,7 +28,7 @@ def setup_logger(filename):
 class MADDPG:
     """A MADDPG(Multi Agent Deep Deterministic Policy Gradient) agent"""
 
-    def __init__(self, dim_info, capacity, batch_size, actor_lr, critic_lr, res_dir):
+    def __init__(self, dim_info, capacity, batch_size, actor_lr, critic_lr, res_dir, num_agents, agent_list):
         # sum all the dims of each agent to get input dim for critic
         global_obs_act_dim = sum(sum(val) for val in dim_info.values())
         # create Agent(actor-critic) and replay buffer for each agent
@@ -36,19 +36,23 @@ class MADDPG:
         self.buffers = {}
         for agent_id, (obs_dim, act_dim) in dim_info.items():
             self.agents[agent_id] = Agent(obs_dim, act_dim, global_obs_act_dim, actor_lr, critic_lr)
-            self.buffers[agent_id] = Buffer(capacity, obs_dim, act_dim, 'cpu')
+            self.buffers[agent_id] = Buffer_op(capacity, obs_dim, act_dim, 1, 'cpu')
+        self.option_buffer = Option_Buffer(capacity, 1, obs_dim, 'cpu')
+        self.option_buffer_ag = Option_Buffer(capacity, 1, obs_dim, 'cpu')
         self.dim_info = dim_info
+        self.option_dim = 1
+        self.option_network = OptionModel(num_agents, 16, obs_dim, self.option_dim, agent_list, 'cpu')
 
         self.batch_size = batch_size
         self.res_dir = res_dir  # directory to save the training result
         self.logger = setup_logger(os.path.join(res_dir, 'maddpg.log'))
 
-    def add(self, obs, action, reward, next_obs, done):
+    def add(self, obs, action, reward, next_obs, done, options):
         # NOTE that the experience is a dict with agent name as its key
-        print(obs)
-        for agent_id in obs.keys():
+        for i, agent_id in enumerate(obs.keys()):
             o = obs[agent_id]
             a = action[agent_id]
+            op = options[i]
             if isinstance(a, int):
                 # the action from env.action_space.sample() is int, we have to convert it to onehot
                 a = np.eye(self.dim_info[agent_id][1])[a]
@@ -56,7 +60,19 @@ class MADDPG:
             r = reward[agent_id]
             next_o = next_obs[agent_id]
             d = done[agent_id]
-            self.buffers[agent_id].add(o, a, r, next_o, d)
+            self.buffers[agent_id].add(o, a, r, next_o, d, op)
+
+    def add_op(self, options, obs, jump_obs):
+        # NOTE that the experience is a dict with agent name as its key
+        for i, agent_id in enumerate(obs.keys()):
+            o = obs[agent_id]
+            op = options[i]
+            no = jump_obs[agent_id]
+            if agent_id.startswith("agent"):
+                self.option_buffer_ag[agent_id].add(op, o, no)
+            else:
+                self.option_buffer[agent_id].add(op, o, no)
+            
 
     def sample(self, batch_size):
         """sample experience from all the agents' buffers, and collect data for network input"""
@@ -66,18 +82,19 @@ class MADDPG:
 
         # NOTE that in MADDPG, we need the obs and actions of all agents
         # but only the reward and done of the current agent is needed in the calculation
-        obs, act, reward, next_obs, done, next_act = {}, {}, {}, {}, {}, {}
+        obs, act, reward, next_obs, done, next_act, options = {}, {}, {}, {}, {}, {}, {}
         for agent_id, buffer in self.buffers.items():
-            o, a, r, n_o, d = buffer.sample(indices)
+            o, a, r, n_o, d, op = buffer.sample(indices)
             obs[agent_id] = o
             act[agent_id] = a
+            options[agent_id] = op
             reward[agent_id] = r
             next_obs[agent_id] = n_o
             done[agent_id] = d
             # calculate next_action using target_network and next_state
             next_act[agent_id] = self.agents[agent_id].target_action(n_o)
 
-        return obs, act, reward, next_obs, done, next_act
+        return obs, act, reward, next_obs, done, next_act, options
 
     def select_action(self, obs):
         actions = {}
@@ -89,9 +106,18 @@ class MADDPG:
             self.logger.info(f'{agent} action: {actions[agent]}')
         return actions
 
+    def update_option(self, obs):
+        options = []  
+        for agent, ob in zip(self.agents, obs):
+            option = agent.update_option(ob, obs)
+            options.append(option)  
+
+        options = torch.stack(options).squeeze()
+        return options
+
     def learn(self, batch_size, gamma):
         for agent_id, agent in self.agents.items():
-            obs, act, reward, next_obs, done, next_act = self.sample(batch_size)
+            obs, act, reward, next_obs, done, next_act, option = self.sample(batch_size)
             # update critic
             critic_value = agent.critic_value(list(obs.values()), list(act.values()))
 
@@ -112,6 +138,18 @@ class MADDPG:
             agent.update_actor(actor_loss + 1e-3 * actor_loss_pse)
             # self.logger.info(f'agent{i}: critic loss: {critic_loss.item()}, actor loss: {actor_loss.item()}')
 
+    def learn_option_model(self):
+        self.option_network.train_step(self.option_buffer, self.option_buffer_ag)
+    
+    def generate_options_for_all_agents(self, obs_all):
+        options = self.option_network.generate_options_for_all_agents(obs_all)
+        agent_list = []
+        for agent in self.agents.values():
+            agent_list.append(agent)
+        for agent, option in zip(agent_list, options):
+            agent.update_option(option)
+        return options
+        
     def update_target(self, tau):
         def soft_update(from_network, to_network):
             """ copy the parameters of `from_network` to `to_network` with a proportion of tau"""
